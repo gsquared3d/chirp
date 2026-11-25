@@ -541,9 +541,17 @@ class IcomCIVRadio(icf.IcomLiveRadio):
         raise errors.RadioError("Radio does not support special channels")
 
     def _send_frame(self, frame):
-        self._last_request = frame
-        self._last_request_cmd = (frame._cmd, frame._sub,
-                                  len(frame.get_data()))
+        # Keep a copy of what was sent: callers read the reply into the same
+        # Frame object, so by the time a read is retried it may hold another
+        # frame's contents (PROG-041).
+        data = frame.get_data()
+        if isinstance(data, MemoryMapBytes):
+            data = data.get_packed()
+        request = Frame()
+        request.set_command(frame._cmd, frame._sub)
+        request.set_data(bytes(data))
+        self._last_request = request
+        self._last_request_cmd = (frame._cmd, frame._sub, len(data))
         return frame.send(ord(self._model), 0xE0, self.pipe,
                           willecho=self._willecho)
 
