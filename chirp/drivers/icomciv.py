@@ -664,6 +664,65 @@ class IcomCIVRadio(icf.IcomLiveRadio):
         else:
             return repr(f.get_obj())
 
+    # gsquared3d fork (W-25, D-135): read and write one memory's record exactly
+    # as the radio holds it, including the parts CHIRP's Memory doesn't model
+    # (e.g. the IC-7000's TX half on a non-split channel), so a saved record
+    # can be put back byte for byte.
+
+    def _location_bytes(self, number):
+        """The location prefix (bank and/or channel) the radio uses for
+        CHIRP memory `number` in a 0x1A 0x00 frame."""
+        f = self._classes["mem"]()
+        if self._is_special(number):
+            info = self._get_special_info(number)
+            if self._rf.has_bank:
+                f.set_location(info.channel, info.bank)
+            else:
+                f.set_location(info.channel)
+        elif self._rf.has_bank:
+            ch, bnk = self.mem_to_ch_bnk(number)
+            f.set_location(ch, bnk)
+        else:
+            f.set_location(number)
+        return bytes(f.get_data())
+
+    def get_raw_slot(self, number):
+        """Return memory `number`'s record as the radio sent it: the bytes
+        after the 0x1A 0x00 command, starting with the location. An empty
+        memory is its location followed by 0xFF."""
+        self._detect_baudrate()
+        loc = self._location_bytes(number)
+        f = self._classes["mem"]()
+        f.set_data(loc)
+        self._send_frame(f)
+        f = self._recv_frame(f)
+        data = bytes(f.get_data())
+        if not data.startswith(loc):
+            raise errors.RadioError(
+                "Radio answered for another memory (%s, asked %s)" % (
+                    data[:len(loc)].hex(), loc.hex()))
+        return data
+
+    def set_raw_slot(self, number, record):
+        """Send `record` (as returned by get_raw_slot) back to memory
+        `number` unchanged, and raise RadioError unless the radio answers OK.
+        The record's location must be memory `number`'s."""
+        self._detect_baudrate()
+        record = bytes(record)
+        loc = self._location_bytes(number)
+        if not record.startswith(loc) or len(record) <= len(loc):
+            raise errors.InvalidDataError(
+                "Record is not for memory %s (location %s)" % (
+                    number, loc.hex()))
+        f = self._classes["mem"]()
+        f.set_data(record)
+        self._send_frame(f)
+        res = self._recv_frame()
+        if res._cmd != 0xFB:
+            raise errors.RadioError(
+                "Radio refused the record for memory %s (reply %02X)" % (
+                    number, res._cmd))
+
 # We have a simple mapping between the memory location in the frequency
 # editor and (bank, channel) of the radio.  The mapping doesn't
 # change so we use a little math to calculate what bank a location
