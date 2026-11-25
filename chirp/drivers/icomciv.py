@@ -1,6 +1,7 @@
 # Latest update: Jan, 2025 add IC7410 support
 import struct
 import logging
+import time
 from chirp.drivers import icf
 from chirp import chirp_common, util, errors, bitwise, directory
 from chirp.memmap import MemoryMapBytes
@@ -285,6 +286,19 @@ char name[10];             // 18-27 Callsign
 
 SPLIT = ["", "spl"]
 
+# gsquared3d fork (ham-radio-coordinator PROG-041): how many frames the radio
+# may send that are not the answer to our request (CI-V Transceive broadcasts
+# while someone turns the dial) before we give up on the answer.
+MAX_UNASKED_FRAMES = 50
+# Reads that time out this soon after the port opens are sent again (seen on
+# the CT-17), at most this many times.
+EARLY_WINDOW_S = 5.0
+EARLY_RETRIES = 2
+
+
+class CIVTimeout(errors.RadioError):
+    """The radio sent nothing (or stopped mid-frame) before the timeout."""
+
 
 class Frame:
     """Base class for an ICF frame"""
@@ -339,7 +353,7 @@ class Frame:
             char = serial.read(1)
             if not char:
                 LOG.debug("Read %i bytes total" % len(data))
-                raise errors.RadioError("Timeout")
+                raise CIVTimeout("Timeout")
             data.extend(char)
 
         if data[0] == 0xFD:
@@ -527,14 +541,61 @@ class IcomCIVRadio(icf.IcomLiveRadio):
         raise errors.RadioError("Radio does not support special channels")
 
     def _send_frame(self, frame):
+        self._last_request = frame
+        self._last_request_cmd = (frame._cmd, frame._sub,
+                                  len(frame.get_data()))
         return frame.send(ord(self._model), 0xE0, self.pipe,
                           willecho=self._willecho)
+
+    def _is_read_request(self):
+        """True if the last request only reads (safe to send again).
+
+        Memory reads (0x1A 0x00) carry just the location; a memory write
+        carries the whole record.
+        """
+        cmd, sub, length = self._last_request_cmd
+        return cmd == 0x1A and sub == 0x00 and length <= 3
+
+    def _is_reply(self, src, dst, frame):
+        """True if a frame read from the radio answers our own request.
+
+        gsquared3d fork (PROG-041). @src and @dst are the frame's CI-V
+        addresses, @frame holds its command (frame._cmd) and data. Our
+        address is 0xE0, the radio's is ord(self._model). With CI-V
+        Transceive on, the radio also announces every dial change by
+        itself (command 0x00 or 0x01); those must not count as answers.
+        """
+        # TODO(human)
+        raise NotImplementedError
 
     def _recv_frame(self, frame=None):
         if not frame:
             frame = Frame()
-        frame.read(self.pipe)
-        return frame
+        retries = 0
+        while True:
+            try:
+                return self._recv_reply(frame)
+            except CIVTimeout:
+                early = (time.monotonic() - self._opened_at) < EARLY_WINDOW_S
+                if (self._detecting or not early or retries >= EARLY_RETRIES
+                        or self._last_request is None
+                        or not self._is_read_request()):
+                    raise
+                retries += 1
+                LOG.info("Early timeout, sending the read again (%i/%i)",
+                         retries, EARLY_RETRIES)
+                self._send_frame(self._last_request)
+
+    def _recv_reply(self, frame):
+        """Read frames until one answers our request (PROG-041)."""
+        for _ in range(MAX_UNASKED_FRAMES + 1):
+            src, dst = frame.read(self.pipe)
+            if self._is_reply(src, dst, frame):
+                return frame
+            LOG.debug("Ignoring a frame we did not ask for: %02x -> %02x "
+                      "cmd %02x", src, dst, frame._cmd)
+        raise errors.RadioError(
+            "No answer among %i frames the radio sent" % MAX_UNASKED_FRAMES)
 
     def _initialize(self):
         pass
@@ -557,6 +618,9 @@ class IcomCIVRadio(icf.IcomLiveRadio):
         bauds.remove(self.BAUD_RATE)
         bauds.insert(0, self.BAUD_RATE)
         self.pipe.timeout = 0.25
+        # No early-timeout retries while trying bauds: a wrong baud times out
+        # by design.
+        self._detecting = True
         for baud in bauds:
             LOG.debug('Trying %i baud' % baud)
             self.pipe.baudrate = baud
@@ -573,10 +637,17 @@ class IcomCIVRadio(icf.IcomLiveRadio):
                 self.BAUD_RATE))
             self.pipe.baudrate = self.BAUD_RATE
 
+        self._detecting = False
         # Restore the historical default of 1s timeout for this driver
         self.pipe.timeout = 1
 
     def __init__(self, *args, **kwargs):
+        # PROG-041: set before IcomLiveRadio.__init__, which may talk to
+        # the radio.
+        self._opened_at = time.monotonic()
+        self._detecting = False
+        self._last_request = None
+        self._last_request_cmd = (None, None, 0)
         icf.IcomLiveRadio.__init__(self, *args, **kwargs)
 
         self._classes = {
